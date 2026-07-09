@@ -12,7 +12,6 @@ print(f"Hidden size: {config.hidden_size}")
 print(f"Activation function: {config.hidden_act}")
 
 # 2. Load the model directly into the Qwen2ForCausalLM class
-# This bypasses AutoModel and strictly enforces the Qwen2 architecture
 model = Qwen2ForCausalLM.from_pretrained(
     model_path,
     config=config,
@@ -27,7 +26,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_path)
 # 3. Setup the chat template
 messages = [
     {"role": "system", "content": "You are a helpful coding assistant."},
-    {"role": "user", "content": "Explain how Grouped-Query Attention works."}
+    {"role": "user", "content": "Write an essay on the importance of AI in modern education in 300 words."}
 ]
 
 text = tokenizer.apply_chat_template(
