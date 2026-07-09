@@ -1,0 +1,53 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+eggs/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+wheelhouse/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# VSCode
+.vscode/
+
+# PyCharm
+.idea/
+
+# Logs and databases
+*.log
+*.sqlite3
+
+# macOS
+.DS_Store
+
+# Python environment
+*.env
+*.venv
+
+# Model files and large artifacts
+*.safetensors
+*.safetensors.index.json
+model-*.safetensors
+model.safetensors.index.json
+
+# Tokenizers / caches
+tokenizer.json
+tokenizer_config.json
+
+# Backup and temporary files
+*.bak
+*.tmp
