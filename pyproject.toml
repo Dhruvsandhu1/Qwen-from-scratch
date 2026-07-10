@@ -1,0 +1,21 @@
+[tool.black]
+line-length = 120
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 120
+select = [
+  "E",
+  "F",
+  "W",
+  "C",
+  "N",
+]
+ignore = ["E203"]
+
+[tool.isort]
+profile = "black"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
