@@ -1,9 +1,9 @@
 # Runtime dependencies (pinned for reproducible inference)
-transformers==4.43.1
-accelerate==0.20.3
+transformers
+accelerate
 # PyTorch: install the correct build for your CUDA version. Minimum required:
 # For CPU-only: pip install torch --index-url https://download.pytorch.org/whl/cpu
 # For CUDA: follow https://pytorch.org/get-started/locally/
-torch>=2.2.0
-safetensors==0.4.2
-tokenizers==0.15.3
+torch
+safetensors
+tokenizers
