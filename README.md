@@ -30,6 +30,33 @@ pip install -r requirements.txt
 python inference.py
 ```
 
+Interactive mode
+----------------
+To run an interactive session that keeps the model loaded between prompts:
+
+```bash
+python examples/interactive_inference.py --model_path model
+```
+
+Press Ctrl-C or type `exit` to quit. After each response press Enter to clear the screen and continue.
+
+Editable install
+----------------
+Install the package in editable mode so you can import `src` and edit code in-place:
+
+```bash
+pip install -e .
+```
+
+Testing
+-------
+Run the smoke tests (they skip if `model/` is not present):
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
+
 ## Notes
 - Large model files (`*.safetensors`) are large and often excluded from VCS; see `.gitignore`.
 - If you obtained model files from a third-party provider, follow their licensing and usage terms.

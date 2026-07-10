@@ -1,6 +1,7 @@
 """Inference script for the Qwen2 model"""
 
 import torch
+
 from src.modeling_qwen2 import Qwen2ForCausalLM
 from transformers import AutoTokenizer, AutoConfig
 import argparse

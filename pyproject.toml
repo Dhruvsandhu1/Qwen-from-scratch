@@ -1,9 +1,9 @@
 [tool.black]
-line-length = 120
+line-length = 300
 target-version = ['py311']
 
 [tool.ruff]
-line-length = 120
+line-length = 300
 select = [
   "E",
   "F",
