@@ -1,14 +1,28 @@
 """Qwen2 model configuration"""
 
-from huggingface_hub.dataclasses import strict
+try:
+    from transformers.configuration_utils import PreTrainedConfig
+except Exception:
+    # Some HF versions use `PretrainedConfig` (different capitalization)
+    from transformers.configuration_utils import PretrainedConfig as PreTrainedConfig
+try:
+    from transformers.modeling_rope_utils import RopeParameters
+except Exception:
+    # Minimal fallback dataclass for RopeParameters used only for typing/defaults.
+    from dataclasses import dataclass
 
-from transformers.configuration_utils import PreTrainedConfig
-from transformers.modeling_rope_utils import RopeParameters
-from transformers.utils import auto_docstring
+    @dataclass
+    class RopeParameters(dict):
+        # Provide dict-like behavior for simple access patterns used in the code.
+        rope_type: str = "default"
+        rope_theta: float = 10000.0
+
+        def __post_init__(self):
+            # Ensure dict-like access
+            self.update({"rope_type": self.rope_type, "rope_theta": self.rope_theta})
 
 
-@auto_docstring(checkpoint="Qwen/Qwen2-7B")
-@strict
+# Skip `@auto_docstring` here to keep compatibility with different HF versions.
 class Qwen2Config(PreTrainedConfig):
     r"""
     Example:
@@ -73,14 +87,7 @@ class Qwen2Config(PreTrainedConfig):
             self.num_key_value_heads = self.num_attention_heads
 
         if self.layer_types is None:
-            self.layer_types = [
-                (
-                    "sliding_attention"
-                    if self.sliding_window is not None and i >= self.max_window_layers
-                    else "full_attention"
-                )
-                for i in range(self.num_hidden_layers)
-            ]
+            self.layer_types = [("sliding_attention" if self.sliding_window is not None and i >= self.max_window_layers else "full_attention") for i in range(self.num_hidden_layers)]
 
         super().__post_init__(**kwargs)
 

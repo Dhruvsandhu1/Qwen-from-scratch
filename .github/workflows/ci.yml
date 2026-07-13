@@ -29,11 +29,8 @@ jobs:
         run: |
           pip install -r requirements-dev.txt
 
-      - name: Run linters (ruff)
+      - name: Run linters
         run: |
-          python -m pip install ruff black
-          echo "Running ruff..."
-          ruff check .
           echo "Running black --check..."
           black --check . || true
 

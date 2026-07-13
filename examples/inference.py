@@ -63,7 +63,8 @@ try:
         model_path,
         config=config,
         torch_dtype=getattr(torch, args.dtype),
-        device_map=args.device_map if args.device_map == "cuda" else None,
+        device_map=args.device_map if args.device_map != "cpu" else None,
+        attn_implementation="flash_attention_2",
     )
 except Exception as e:
     logger.exception("Failed to load model: {}", e)
