@@ -43,6 +43,9 @@ def flash_attention_forward(
     if any(dim == 0 for dim in query.shape):
         raise ValueError("Tensor query has shape  with a zero dimension.\n" "FlashAttention does not support inputs with dim=0.\n" "Please check your input shapes or use SDPA instead.")
 
+    key_scales = kwargs.get("key_scales", None)
+    value_scales = kwargs.get("value_scales", None)
+
     target_dtype = get_target_dtype(query, module)
     if target_dtype is not None:
         query = query.to(target_dtype)
@@ -56,15 +59,16 @@ def flash_attention_forward(
     if query.shape[2] != key.shape[2]:  # Sequence length not equal meaning a decoding time step
         if query.shape[2] == 1 and attention_mask is None:
             # Use our custom Triton flash decoding for text generation
-            attn_output = flash_decode(query, key, value, sm_scale=scaling)
+            attn_output = flash_decode(query, key, value, sm_scale=scaling, key_scales=key_scales, value_scales=value_scales)
         else:
             # print("Using SDPA") # Removed print to avoid console IO overhead during autoregressive generation
             if query.shape[1] != key.shape[1]:  # Number of heads not equal meaning a GQA model
                 num_queries_per_kv = query.shape[1] // key.shape[1]
                 # Fallback SDPA needs expanded KV heads.
-                # Note: repeat_interleave copies memory, which is slow for generation, but this is just a fallback.
-                key = torch.repeat_interleave(key, num_queries_per_kv, dim=1)
-                value = torch.repeat_interleave(value, num_queries_per_kv, dim=1)
+                # Note: expand creates a zero-copy view, which is much faster than repeat_interleave
+                batch, h_kv, seq, dim = key.shape
+                key = key[:, :, None, :, :].expand(batch, h_kv, num_queries_per_kv, seq, dim).reshape(batch, -1, seq, dim)
+                value = value[:, :, None, :, :].expand(batch, h_kv, num_queries_per_kv, seq, dim).reshape(batch, -1, seq, dim)
 
             attn_output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=dropout if module.training else 0.0, is_causal=is_causal and query.shape[2] > 1, scale=scaling)
 

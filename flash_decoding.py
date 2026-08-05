@@ -40,6 +40,8 @@ def _flash_decoding_stage1_kernel(
     Mid_O,
     Mid_M,
     Mid_L,
+    K_scale,
+    V_scale,
     stride_q_batch,
     stride_q_head,
     stride_q_seq,
@@ -62,6 +64,15 @@ def _flash_decoding_stage1_kernel(
     stride_mid_l_batch,
     stride_mid_l_head,
     stride_mid_l_seq,
+    stride_ks_batch,
+    stride_ks_head,
+    stride_ks_seq,
+    stride_ks_dim,
+    stride_vs_batch,
+    stride_vs_head,
+    stride_vs_seq,
+    stride_vs_dim,
+    IS_INT8: tl.constexpr,
     Z,
     H,
     H_KV,
@@ -86,6 +97,10 @@ def _flash_decoding_stage1_kernel(
     k_offset = batch_id * stride_k_batch + kv_head_id * stride_k_head
     v_offset = batch_id * stride_v_batch + kv_head_id * stride_v_head
 
+    if IS_INT8:
+        ks_offset = batch_id * stride_ks_batch + kv_head_id * stride_ks_head
+        vs_offset = batch_id * stride_vs_batch + kv_head_id * stride_vs_head
+
     offs_d = tl.arange(0, HEAD_DIM)
 
     # Load Query (length 1)
@@ -109,10 +124,19 @@ def _flash_decoding_stage1_kernel(
     k_ptrs = K + k_offset + offs_kv[:, None] * stride_k_seq + offs_d[None, :] * stride_k_dim
     v_ptrs = V + v_offset + offs_kv[:, None] * stride_v_seq + offs_d[None, :] * stride_v_dim
 
+    if IS_INT8:
+        ks_ptrs = K_scale + ks_offset + offs_kv * stride_ks_seq
+        vs_ptrs = V_scale + vs_offset + offs_kv * stride_vs_seq
+
     for block_idx in range(start_block, end_block):
         # Load K block
         mask = offs_kv[:, None] < N_CTX
-        k = tl.load(k_ptrs, mask=mask, other=0.0)
+        if IS_INT8:
+            k_int8 = tl.load(k_ptrs, mask=mask, other=0.0).to(tl.int8)
+            ks = tl.load(ks_ptrs, mask=offs_kv < N_CTX, other=0.0)
+            k = k_int8.to(tl.float32) * ks[:, None]
+        else:
+            k = tl.load(k_ptrs, mask=mask, other=0.0).to(tl.float32)
 
         # Compute Q * K^T
         qk = tl.sum(q[None, :] * k, axis=1)  # Shape: (BLOCK_KV,)
@@ -131,7 +155,12 @@ def _flash_decoding_stage1_kernel(
         l_i_new = l_i * alpha + l_ij
 
         # Load V block and update output
-        v = tl.load(v_ptrs, mask=mask, other=0.0)
+        if IS_INT8:
+            v_int8 = tl.load(v_ptrs, mask=mask, other=0.0).to(tl.int8)
+            vs = tl.load(vs_ptrs, mask=offs_kv < N_CTX, other=0.0)
+            v = v_int8.to(tl.float32) * vs[:, None]
+        else:
+            v = tl.load(v_ptrs, mask=mask, other=0.0).to(tl.float32)
 
         out_i = out_i * alpha + tl.sum(p[:, None] * v, axis=0)
 
@@ -141,6 +170,9 @@ def _flash_decoding_stage1_kernel(
         # Advance pointers for the next iteration (much faster than recomputing)
         k_ptrs += BLOCK_KV * stride_k_seq
         v_ptrs += BLOCK_KV * stride_v_seq
+        if IS_INT8:
+            ks_ptrs += BLOCK_KV * stride_ks_seq
+            vs_ptrs += BLOCK_KV * stride_vs_seq
         offs_kv += BLOCK_KV
 
     # Store intermediate results to global memory ONCE at the end
@@ -234,7 +266,7 @@ def _flash_decoding_stage2_kernel(
     tl.store(out_ptrs, out)
 
 
-def flash_decode(q, k, v, sm_scale=None):
+def flash_decode(q, k, v, sm_scale=None, key_scales=None, value_scales=None):
     """
     Computes flash decoding attention for seq_len_q = 1.
     Args:
@@ -247,17 +279,26 @@ def flash_decode(q, k, v, sm_scale=None):
     assert q.shape[2] == 1, "Flash decoding expects query sequence length to be 1."
     assert k.shape == v.shape, "K and V must have the same shape."
 
+    IS_INT8 = key_scales is not None and value_scales is not None
+
     Z, H, _, HEAD_DIM = q.shape
     _, H_KV, N_CTX, _ = k.shape
 
     BLOCK_KV = 128
     total_kv_blocks = triton.cdiv(N_CTX, BLOCK_KV)
 
-    # Define SPLIT_K size (e.g. 16 or 32 for optimal grid size)
-    # If total_kv_blocks is smaller, we just use total_kv_blocks.
-    SPLIT_K = min(16, total_kv_blocks)
-    if SPLIT_K == 0:
-        SPLIT_K = 1
+    # Dynamic hardware-aware SPLIT_K heuristic
+    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+
+    # We want to launch enough blocks to keep all SMs busy.
+    # A good target is ~4 blocks per SM to hide latency.
+    target_grid_size = num_sms * 4
+
+    # The stage 1 grid size is (SPLIT_K, Z * H)
+    desired_split_k = target_grid_size // (Z * H)
+
+    # Clamp SPLIT_K between 1 and total_kv_blocks
+    SPLIT_K = min(total_kv_blocks, max(1, desired_split_k))
 
     # Ensure next power of 2 for BLOCK_NUM in stage 2
     BLOCK_NUM = triton.next_power_of_2(SPLIT_K) if SPLIT_K > 0 else 1
@@ -277,6 +318,8 @@ def flash_decode(q, k, v, sm_scale=None):
         mid_o,
         mid_m,
         mid_l,
+        key_scales,
+        value_scales,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -299,6 +342,15 @@ def flash_decode(q, k, v, sm_scale=None):
         mid_l.stride(0),
         mid_l.stride(1),
         mid_l.stride(2),
+        key_scales.stride(0) if IS_INT8 else 0,
+        key_scales.stride(1) if IS_INT8 else 0,
+        key_scales.stride(2) if IS_INT8 else 0,
+        key_scales.stride(3) if IS_INT8 else 0,
+        value_scales.stride(0) if IS_INT8 else 0,
+        value_scales.stride(1) if IS_INT8 else 0,
+        value_scales.stride(2) if IS_INT8 else 0,
+        value_scales.stride(3) if IS_INT8 else 0,
+        IS_INT8,
         Z,
         H,
         H_KV,

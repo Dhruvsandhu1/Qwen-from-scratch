@@ -40,7 +40,7 @@ def _attn_fwd_inner(
     for start_kv in range(lo, hi, BLOCK_SIZE_KV):
         # We process the KV blocks in chunks
         K_block = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
-        QK_block = tl.dot(Q_block, K_block)
+        QK_block = tl.dot(Q_block, K_block, out_dtype=tl.float32)
 
         if STAGE == 2:
             mask = offs_q[:, None] >= (start_kv + offs_kv[None, :])
@@ -123,13 +123,24 @@ def _attn_fwd(
     BLOCK_SIZE_KV: tl.constexpr,
     STAGE: tl.constexpr,
 ):
+    """
+    This kernel is used to compute the forward pass of the attention mechanism.
+    It is used to compute the attention scores between the queries and the keys and the values.
+
+    """
     tl.static_assert(BLOCK_SIZE_KV <= HEAD_DIM)
 
-    # This indicate which block in the sequence length to process
-    block_index_q = tl.program_id(0)
-
-    # This indicates which head and batch to process. Each program is associated with a single head of a single batch
-    index_batch_head = tl.program_id(1)
+    # L2 Cache Swizzling
+    pid = tl.program_id(0)
+    NUM_PID_M = tl.cdiv(SEQ_LEN, BLOCK_SIZE_Q)
+    NUM_PID_N = BATCH_SIZE * NUM_HEADS
+    GROUP_SIZE_M = 8
+    num_pid_in_group = GROUP_SIZE_M * NUM_PID_N
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(NUM_PID_M - first_pid_m, GROUP_SIZE_M)
+    block_index_q = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    index_batch_head = (pid % num_pid_in_group) // group_size_m
     # This indicate which batch this program is associated with (each batch has NUM_HEADS heads)
     index_batch = index_batch_head // NUM_HEADS
     # This indicate the position of the head in the batch
@@ -265,6 +276,10 @@ def _attn_bwd_preprocess(
     tl.store(D_block_ptrs, D_block)
 
 
+@triton.autotune(
+    [triton.Config({"BLOCK_Q": BLOCK_Q, "BLOCK_KV": BLOCK_KV}, num_stages=num_stages, num_warps=num_warps) for BLOCK_Q in [32, 64, 128] for BLOCK_KV in [32, 64, 128] for num_stages in [2, 3, 4] for num_warps in [4, 8]],
+    key=["SEQ_LEN", "HEAD_DIM"],
+)
 @triton.jit
 def _attn_bwd_dq(
     Q,
@@ -362,6 +377,10 @@ def _attn_bwd_dq(
     tl.store(dQ_block_ptrs, dQ_block)
 
 
+@triton.autotune(
+    [triton.Config({"BLOCK_Q": BLOCK_Q, "BLOCK_KV": BLOCK_KV}, num_stages=num_stages, num_warps=num_warps) for BLOCK_Q in [32, 64, 128] for BLOCK_KV in [32, 64, 128] for num_stages in [2, 3, 4] for num_warps in [4, 8]],
+    key=["SEQ_LEN", "HEAD_DIM"],
+)
 @triton.jit
 def _attn_bwd_dk_dv(
     Q,
@@ -498,8 +517,8 @@ class TritonAttention(torch.autograd.Function):
         stage = 3 if causal else 1
 
         grid = lambda args: (
-            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
-            BATCH_SIZE * NUM_HEADS,
+            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]) * (BATCH_SIZE * NUM_HEADS),
+            1,
             1,
         )
 

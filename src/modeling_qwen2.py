@@ -2,9 +2,11 @@ from collections.abc import Callable
 from typing import Optional
 import torch
 from torch import nn
+import triton
+import triton.language as tl
 
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import (
     use_kernel_forward_from_hub,
@@ -37,6 +39,61 @@ from .configuration_qwen2 import Qwen2Config
 from .flash_attention import flash_attention_forward
 
 
+@triton.jit
+def _swiglu_kernel(GATE, UP, OUT, stride_g_row, stride_u_row, stride_o_row, N_COLS: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    row_idx = tl.program_id(0)
+
+    GATE += row_idx * stride_g_row
+    UP += row_idx * stride_u_row
+    OUT += row_idx * stride_o_row
+
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N_COLS
+
+    gate = tl.load(GATE + cols, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(UP + cols, mask=mask, other=0.0).to(tl.float32)
+
+    gate_silu = gate * tl.sigmoid(gate)
+    out = gate_silu * up
+
+    tl.store(OUT + cols, out.to(GATE.dtype.element_ty), mask=mask)
+
+
+class QuantizedStaticCache(StaticCache):
+    def __init__(self, config, max_batch_size, max_cache_len, device, dtype):
+        super().__init__(config, max_batch_size, max_cache_len, device, dtype)
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.key_cache = [torch.zeros((max_batch_size, config.num_key_value_heads, max_cache_len, head_dim), dtype=torch.int8, device=device) for _ in range(config.num_hidden_layers)]
+        self.value_cache = [torch.zeros((max_batch_size, config.num_key_value_heads, max_cache_len, head_dim), dtype=torch.int8, device=device) for _ in range(config.num_hidden_layers)]
+        self.key_scales = [torch.zeros((max_batch_size, config.num_key_value_heads, max_cache_len, 1), dtype=torch.float32, device=device) for _ in range(config.num_hidden_layers)]
+        self.value_scales = [torch.zeros((max_batch_size, config.num_key_value_heads, max_cache_len, 1), dtype=torch.float32, device=device) for _ in range(config.num_hidden_layers)]
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int, cache_kwargs=None) -> tuple[torch.Tensor, torch.Tensor]:
+        k_out = self.key_cache[layer_idx]
+        v_out = self.value_cache[layer_idx]
+        ks_out = self.key_scales[layer_idx]
+        vs_out = self.value_scales[layer_idx]
+
+        k_scales = key_states.abs().amax(dim=-1, keepdim=True) / 127.0
+        v_scales = value_states.abs().amax(dim=-1, keepdim=True) / 127.0
+
+        k_int8 = torch.round(key_states / k_scales.clamp(min=1e-5)).to(torch.int8)
+        v_int8 = torch.round(value_states / v_scales.clamp(min=1e-5)).to(torch.int8)
+
+        cache_kwargs = cache_kwargs or {}
+        cache_position = cache_kwargs.get("cache_position")
+        if cache_position is None:
+            seq_len = key_states.shape[2]
+            cache_position = torch.arange(self.get_seq_length(layer_idx), self.get_seq_length(layer_idx) + seq_len, device=key_states.device)
+
+        k_out[:, :, cache_position, :] = k_int8
+        v_out[:, :, cache_position, :] = v_int8
+        ks_out[:, :, cache_position, :] = k_scales.to(torch.float32)
+        vs_out[:, :, cache_position, :] = v_scales.to(torch.float32)
+
+        return k_out, v_out
+
+
 class Qwen2MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -49,7 +106,20 @@ class Qwen2MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+
+        gate_2d = gate.view(-1, gate.shape[-1])
+        up_2d = up.view(-1, up.shape[-1])
+        N_ROWS, N_COLS = gate_2d.shape
+
+        out_2d = torch.empty_like(gate_2d)
+        BLOCK_SIZE = triton.next_power_of_2(N_COLS)
+
+        _swiglu_kernel[(N_ROWS,)](gate_2d, up_2d, out_2d, gate_2d.stride(0), up_2d.stride(0), out_2d.stride(0), N_COLS, BLOCK_SIZE=BLOCK_SIZE)
+
+        out = out_2d.view_as(gate)
+        down_proj = self.down_proj(out)
         return down_proj
 
 
@@ -116,11 +186,52 @@ class Qwen2RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+@triton.jit
+def _rope_kernel(
+    X,
+    COS,
+    SIN,
+    stride_x_b,
+    stride_x_h,
+    stride_x_s,
+    stride_x_d,
+    stride_c_b,
+    stride_c_s,
+    stride_c_d,
+    HALF_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    seq_idx = tl.program_id(2)
+
+    c_offset = batch_idx * stride_c_b + seq_idx * stride_c_s
+    x_offset = batch_idx * stride_x_b + head_idx * stride_x_h + seq_idx * stride_x_s
+
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < HALF_DIM
+
+    x1_ptrs = X + x_offset + cols * stride_x_d
+    x1 = tl.load(x1_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    x2_ptrs = X + x_offset + (cols + HALF_DIM) * stride_x_d
+    x2 = tl.load(x2_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    c1_ptrs = COS + c_offset + cols * stride_c_d
+    c1 = tl.load(c1_ptrs, mask=mask, other=0.0).to(tl.float32)
+    c2_ptrs = COS + c_offset + (cols + HALF_DIM) * stride_c_d
+    c2 = tl.load(c2_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    s1_ptrs = SIN + c_offset + cols * stride_c_d
+    s1 = tl.load(s1_ptrs, mask=mask, other=0.0).to(tl.float32)
+    s2_ptrs = SIN + c_offset + (cols + HALF_DIM) * stride_c_d
+    s2 = tl.load(s2_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    out1 = x1 * c1 - x2 * s1
+    out2 = x2 * c2 + x1 * s2
+
+    tl.store(x1_ptrs, out1.to(X.dtype.element_ty), mask=mask)
+    tl.store(x2_ptrs, out2.to(X.dtype.element_ty), mask=mask)
 
 
 @use_kernel_func_from_hub("rotary_pos_emb")
@@ -142,11 +253,26 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    # Ensure tensors are contiguous if required, but Triton handles strides.
+    # The shape of q/k could be [batch, heads, seq, head_dim] or [batch, seq, heads, head_dim]
+    # We figure out the strides dynamically.
+
+    # cos and sin have shape [batch, seq, head_dim]
+    BATCH = q.shape[0]
+    HEADS_Q = q.shape[1] if unsqueeze_dim == 1 else q.shape[2]
+    HEADS_K = k.shape[1] if unsqueeze_dim == 1 else k.shape[2]
+    SEQ_LEN = q.shape[2] if unsqueeze_dim == 1 else q.shape[1]
+    HEAD_DIM = q.shape[-1]
+    HALF_DIM = HEAD_DIM // 2
+    BLOCK_SIZE = triton.next_power_of_2(HALF_DIM)
+
+    # Q Launch
+    _rope_kernel[(BATCH, HEADS_Q, SEQ_LEN)](q, cos, sin, q.stride(0), q.stride(1 if unsqueeze_dim == 1 else 2), q.stride(2 if unsqueeze_dim == 1 else 1), q.stride(3), cos.stride(0), cos.stride(1), cos.stride(2), HALF_DIM, BLOCK_SIZE=BLOCK_SIZE)
+
+    # K Launch
+    _rope_kernel[(BATCH, HEADS_K, SEQ_LEN)](k, cos, sin, k.stride(0), k.stride(1 if unsqueeze_dim == 1 else 2), k.stride(2 if unsqueeze_dim == 1 else 1), k.stride(3), cos.stride(0), cos.stride(1), cos.stride(2), HALF_DIM, BLOCK_SIZE=BLOCK_SIZE)
+
+    return q, k
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -227,6 +353,10 @@ class Qwen2Attention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
+        if isinstance(past_key_values, QuantizedStaticCache):
+            kwargs["key_scales"] = past_key_values.key_scales[self.layer_idx]
+            kwargs["value_scales"] = past_key_values.value_scales[self.layer_idx]
+
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(self.config._attn_implementation, eager_attention_forward)
         if self.config._attn_implementation == "flash_attention_2":
             attention_interface = flash_attention_forward
@@ -248,6 +378,34 @@ class Qwen2Attention(nn.Module):
         return attn_output, attn_weights
 
 
+@triton.jit
+def _rmsnorm_kernel(
+    X,
+    Y,
+    W,
+    stride_x_row,
+    stride_y_row,
+    N_COLS,
+    EPS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    X += row_idx * stride_x_row
+    Y += row_idx * stride_y_row
+
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N_COLS
+
+    x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+
+    var = tl.sum(x * x, axis=0) / N_COLS
+    rstd = tl.math.rsqrt(var + EPS)
+
+    y = x * rstd * w
+    tl.store(Y + cols, y.to(X.dtype.element_ty), mask=mask)
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen2RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
@@ -259,11 +417,22 @@ class Qwen2RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        hidden_states_2d = hidden_states.view(-1, hidden_states.shape[-1])
+        N_ROWS, N_COLS = hidden_states_2d.shape
+        Y = torch.empty_like(hidden_states_2d)
+
+        BLOCK_SIZE = triton.next_power_of_2(N_COLS)
+        _rmsnorm_kernel[(N_ROWS,)](
+            hidden_states_2d,
+            Y,
+            self.weight,
+            hidden_states_2d.stride(0),
+            Y.stride(0),
+            N_COLS,
+            self.variance_epsilon,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        return Y.view_as(hidden_states)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -368,7 +537,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            # Use QuantizedStaticCache for INT8 KV caching
+            past_key_values = QuantizedStaticCache(config=self.config, max_batch_size=inputs_embeds.shape[0], max_cache_len=self.config.max_position_embeddings, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
 
         if position_ids is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
