@@ -8,30 +8,30 @@
 
 This project re-implements the [Qwen2.5-Coder-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct) model architecture entirely from scratch in PyTorch, without relying on the HuggingFace `transformers` modelling code for the core forward pass. The highlight of this implementation is a **highly optimized, bandwidth-bound inference and training stack** driven by custom Triton kernels.
 
-### ⚡ Performance Highlights & Optimizations
+### Performance Highlights & Optimizations
 
-- 🧠 **From-scratch implementation** — `Qwen2ForCausalLM`, `Qwen2Attention`, `Qwen2MLP`, `Qwen2RMSNorm`, and `Qwen2RotaryEmbedding` implemented manually.
-- 🚀 **Custom Triton Flash Attention (Prefill)** 
+- **From-scratch implementation** — `Qwen2ForCausalLM`, `Qwen2Attention`, `Qwen2MLP`, `Qwen2RMSNorm`, and `Qwen2RotaryEmbedding` implemented manually.
+- **Custom Triton Flash Attention (Prefill)** 
   - Tiled SRAM-based computation for O(1) memory w.r.t. sequence length.
   - Auto-tuning via `@triton.autotune` for both **forward and backward** passes.
   - **L2 Cache Swizzling** for maximized memory locality during grid execution.
   - Causal masking and native Grouped Query Attention (GQA) support.
-- ⚡ **Dynamic Triton Flash Decoding (Generation)**
+- **Dynamic Triton Flash Decoding (Generation)**
   - Replaces PyTorch's SDPA for the decoding phase.
   - Dynamically calculates the optimal `SPLIT_K` factor based on the GPU's hardware topology to guarantee **100% Streaming Multiprocessor (SM) occupancy** regardless of sequence length.
-- 🗜️ **Int8 KV Cache Quantization**
+- **Int8 KV Cache Quantization**
   - Uses `QuantizedStaticCache` to dynamically compress the Key and Value states to `int8` before storing them in VRAM.
-  - The Triton Flash Decoding kernel natively performs **on-the-fly dequantization** directly in SRAM registers, doubling memory bandwidth during generation!
-- 🏎️ **Fused Custom Kernels**
+  - The Triton Flash Decoding kernel natively performs **on-the-fly dequantization** directly in SRAM registers, doubling memory bandwidth during generation.
+- **Fused Custom Kernels**
   - **Fused SwiGLU**: `_swiglu_kernel` eliminates intermediate tensor allocations during the MLP pass.
   - **Fused RMSNorm**: `_rmsnorm_kernel` performs root-mean-square normalization in a single pass.
   - **Fused RoPE**: `_rope_kernel` applies Rotary Position Embeddings without slicing or copying.
-- 📉 **Zero-Copy GQA**
+- **Zero-Copy GQA**
   - Replaced native `repeat_interleave` with a zero-allocation `.expand()` projection for Key and Value heads.
-- 📊 **Static KV Caching**
+- **Static KV Caching**
   - Statically pre-allocates VRAM to eliminate dynamic shape changes and `realloc` bottlenecks during generation.
   - Fully unblocks **CUDA Graph** capture for Python-overhead-free inference.
-- ✅ **Drop-in Compatible** with HuggingFace's `AutoTokenizer` and `GenerationMixin`.
+- **Drop-in Compatible** with HuggingFace's `AutoTokenizer` and `GenerationMixin`.
 
 ---
 
@@ -148,7 +148,7 @@ If you are writing a custom inference script, simply add:
 ```python
 model = torch.compile(model, mode="reduce-overhead")
 ```
-This will allow PyTorch to natively trace the `Qwen2Attention` and `Qwen2MLP` blocks and fuse the parallel Linear projections (`q_proj`, `k_proj`, `v_proj`) together natively without breaking HuggingFace checkpoint loading!
+This will allow PyTorch to natively trace the `Qwen2Attention` and `Qwen2MLP` blocks and fuse the parallel Linear projections (`q_proj`, `k_proj`, `v_proj`) together natively without breaking HuggingFace checkpoint loading.
 
 ---
 
