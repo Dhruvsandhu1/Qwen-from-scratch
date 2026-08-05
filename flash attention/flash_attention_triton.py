@@ -490,8 +490,11 @@ class TritonAttention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, Q, K, V, causal, softmax_scale):
-        HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V = Q.shape[-1], K.shape[-1], V.shape[-1]
+        HEAD_DIM_Q, HEAD_DIM_K = Q.shape[-1], K.shape[-1]
+        HEAD_DIM_V = V.shape[-1]
+
         BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
+
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
 
         O = torch.empty_like(Q)

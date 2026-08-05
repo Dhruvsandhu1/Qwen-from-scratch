@@ -5,6 +5,14 @@ Usage: python examples/benchmark.py --model_path ./model --batch_size 1 --seq_le
 
 import time
 import argparse
+import sys
+import os
+
+# Ensure repository root is on sys.path so `from src...` works when running this script
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
 import torch
 from transformers import AutoTokenizer, AutoConfig
 from src.modeling_qwen2 import Qwen2ForCausalLM
@@ -64,9 +72,9 @@ def measure(args):
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Qwen2 model")
     parser.add_argument("--model_path", type=str, default="./model")
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--seq_len", type=int, default=32)
-    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--seq_len", type=int, default=256)
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--iters", type=int, default=10, help="Number of iterations to measure")
     parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations")
     parser.add_argument("--dtype", type=str, default="float16", help="torch dtype name, e.g. float16, bfloat16, float32")

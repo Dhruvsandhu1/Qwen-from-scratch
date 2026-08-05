@@ -1,11 +1,16 @@
 """Inference script for the Qwen2 model"""
 
+import sys
 import torch
+import os
 
+# Ensure repository root is on sys.path
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 from src.modeling_qwen2 import Qwen2ForCausalLM
 from transformers import AutoTokenizer, AutoConfig
 import argparse
-import sys
 from loguru import logger
 
 # configure logger

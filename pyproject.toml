@@ -1,5 +1,5 @@
 [tool.black]
-line-length = 300
+line-length = 3000
 target-version = ['py311']
 
 [tool.isort]
@@ -8,3 +8,6 @@ profile = "black"
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.pyright]
+extraPaths = [".", "/"]

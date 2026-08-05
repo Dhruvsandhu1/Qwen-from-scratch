@@ -1,6 +1,5 @@
 from collections.abc import Callable
 from typing import Optional
-
 import torch
 from torch import nn
 
@@ -31,6 +30,7 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
+
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 from .configuration_qwen2 import Qwen2Config
@@ -239,7 +239,7 @@ class Qwen2Attention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=self.sliding_window,  # main diff with Llama
+            sliding_window=self.sliding_window,
             **kwargs,
         )
 

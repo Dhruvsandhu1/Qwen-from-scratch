@@ -7,6 +7,12 @@ but the model remains loaded in memory for subsequent queries.
 
 import os
 import sys
+
+# Ensure repository root is on sys.path
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
 import argparse
 import torch
 from loguru import logger
@@ -16,8 +22,10 @@ from src.modeling_qwen2 import Qwen2ForCausalLM
 
 def clear_screen() -> None:
     if os.name == "nt":
+        # pyrefly: ignore [deprecated]
         os.system("cls")
     else:
+        # pyrefly: ignore [deprecated]
         os.system("clear")
 
 
