@@ -78,6 +78,7 @@ def main():
     logger.info("Model loaded. Enter prompts (type 'exit' or Ctrl-C to quit).")
 
     try:
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
         while True:
             prompt = input("You: ")
             if not prompt:
@@ -85,15 +86,21 @@ def main():
             if prompt.strip().lower() in ("exit", "quit"):
                 break
 
-            messages = [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": prompt}]
+            messages.append({"role": "user", "content": prompt})
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
             with torch.no_grad():
-                generated = model.generate(**model_inputs, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
+                generated = model.generate(
+                    **model_inputs,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    do_sample=True if args.temperature != 1.0 else False,
+                )
 
             generated_ids = [out[len(inp) :] for inp, out in zip(model_inputs.input_ids, generated)]
             response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            messages.append({"role": "assistant", "content": response})
 
             print("\nAssistant:\n")
             print(response)

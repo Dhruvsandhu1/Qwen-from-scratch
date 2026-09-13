@@ -13,10 +13,15 @@ def _get_buffers(Z, H, SPLIT_K, HEAD_DIM, dtype, device):
     key = (Z, H, HEAD_DIM, dtype, device, padded_blocks)
 
     if key not in _buffer_cache:
-        _buffer_cache[key] = {"mid_o": torch.empty((Z, H, padded_blocks, HEAD_DIM), dtype=torch.float32, device=device), "mid_m": torch.empty((Z, H, padded_blocks), dtype=torch.float32, device=device), "mid_l": torch.empty((Z, H, padded_blocks), dtype=torch.float32, device=device), "out": torch.empty((Z, H, 1, HEAD_DIM), dtype=dtype, device=device)}
+        _buffer_cache[key] = {"mid_o": torch.empty((Z, H, padded_blocks, HEAD_DIM), dtype=torch.float32, device=device), "mid_m": torch.empty((Z, H, padded_blocks), dtype=torch.float32, device=device), "mid_l": torch.empty((Z, H, padded_blocks), dtype=torch.float32, device=device)}
 
     cache = _buffer_cache[key]
-    return cache["mid_o"], cache["mid_m"], cache["mid_l"], cache["out"]
+    # `out` is intentionally NOT cached/reused: every call returns it directly to
+    # the caller, and every decoder layer shares the same (Z, H, HEAD_DIM, dtype)
+    # key, so a cached `out` would have one layer's result silently overwritten
+    # by the next layer's call as soon as anyone stops copying it immediately.
+    out = torch.empty((Z, H, 1, HEAD_DIM), dtype=dtype, device=device)
+    return cache["mid_o"], cache["mid_m"], cache["mid_l"], out
 
 
 @triton.autotune(

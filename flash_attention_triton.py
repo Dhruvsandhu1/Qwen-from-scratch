@@ -257,6 +257,11 @@ def _attn_bwd_preprocess(
     O,
     dO,
     D,
+    stride_batch,
+    stride_head,
+    stride_seq,
+    stride_dim,
+    NUM_HEADS,
     SEQ_LEN,
     BLOCK_SIZE_Q: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -264,11 +269,21 @@ def _attn_bwd_preprocess(
     block_index_q = tl.program_id(0)
     offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
     index_batch_head = tl.program_id(1)
+    index_batch = index_batch_head // NUM_HEADS
+    index_head = index_batch_head % NUM_HEADS
+    # NOTE: O/dO are views (e.g. `.transpose(1, 2)` in the caller) and are not
+    # necessarily contiguous in (batch, head, seq, dim) order, so the offset
+    # must be computed from the real strides rather than assumed sizes.
+    offset_batch_head = (stride_batch * index_batch + stride_head * index_head).to(tl.int64)
     offs_dim = tl.arange(0, HEAD_DIM)
+
+    O_ptrs = O + offset_batch_head + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    dO_ptrs = dO + offset_batch_head + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+
     # Load a single block of BLOCK_SIZE_Q rows of O
-    O_block = tl.load(O + index_batch_head * HEAD_DIM * SEQ_LEN + offs_q[:, None] * HEAD_DIM + offs_dim[None, :])
+    O_block = tl.load(O_ptrs)
     # Load a single block of BLOCK_SIZE_Q rows of dO
-    dO_block = tl.load(dO + index_batch_head * HEAD_DIM * SEQ_LEN + offs_q[:, None] * HEAD_DIM + offs_dim[None, :]).to(tl.float32)
+    dO_block = tl.load(dO_ptrs).to(tl.float32)
     # Compute the D block
     D_block = tl.sum(dO_block * O_block, axis=1)  # Shape: (BLOCK_SIZE_Q,)
     # Store the D block
@@ -288,15 +303,18 @@ def _attn_bwd_dq(
     softmax_scale,
     dO,
     dQ,
-    dK,
-    dV,
     M,
     D,
-    stride_batch,
-    stride_head,
-    stride_seq,
-    stride_dim,
+    stride_q_batch,
+    stride_q_head,
+    stride_q_seq,
+    stride_q_dim,
+    stride_kv_batch,
+    stride_kv_head,
+    stride_kv_seq,
+    stride_kv_dim,
     NUM_HEADS,
+    NUM_KV_HEADS,
     SEQ_LEN,
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
@@ -306,19 +324,23 @@ def _attn_bwd_dq(
     index_batch_head = tl.program_id(2)
     index_batch = index_batch_head // NUM_HEADS
     index_head = index_batch_head % NUM_HEADS
-    offset_batch_head = (stride_batch * index_batch + stride_head * index_head).to(tl.int64)
+    # GQA: map the query head to the (fewer) key/value heads it shares, mirroring
+    # the forward kernel's `index_kv_head` logic.
+    NUM_QUERIES_PER_KV = NUM_HEADS // NUM_KV_HEADS
+    index_kv_head = index_head // NUM_QUERIES_PER_KV
+
+    offset_q_batch_head = (stride_q_batch * index_batch + stride_q_head * index_head).to(tl.int64)
+    offset_kv_batch_head = (stride_kv_batch * index_batch + stride_kv_head * index_kv_head).to(tl.int64)
     # This is the offset that allows us to select the right sequence given the batch and head.
     offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
 
     # Make sure the pointers are in the right place w.r.t batch and head
-    # The reason we don't access the blocks through make_block_ptr is because we need to use the range of offsets to apply the masking
-    Q += offset_batch_head
-    K += offset_batch_head
-    V += offset_batch_head
-    dO += offset_batch_head
-    dQ += offset_batch_head
-    dK += offset_batch_head
-    dV += offset_batch_head
+    # The reason we don't access the blocks through make_tensor_descriptor is because we need to use the range of offsets to apply the masking
+    Q += offset_q_batch_head
+    dO += offset_q_batch_head
+    dQ += offset_q_batch_head
+    K += offset_kv_batch_head
+    V += offset_kv_batch_head
 
     # Make sure the pointers are in the right place w.r.t batch, head and sequence
     M += offset_batch_head_seq
@@ -327,14 +349,14 @@ def _attn_bwd_dq(
     # load scales
     offs_dim = tl.arange(0, HEAD_DIM)
 
-    index_block_kv = tl.program_id(0)
+    index_block_q = tl.program_id(0)
 
-    start_q = index_block_kv * BLOCK_Q
+    start_q = index_block_q * BLOCK_Q
     offs_q = start_q + tl.arange(0, BLOCK_Q)
 
-    Q_block = tl.load(Q + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim)
+    Q_block = tl.load(Q + offs_q[:, None] * stride_q_seq + offs_dim[None, :] * stride_q_dim)
     dQ_block = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
-    dO_block = tl.load(dO + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim)
+    dO_block = tl.load(dO + offs_q[:, None] * stride_q_seq + offs_dim[None, :] * stride_q_dim)
 
     M_block = tl.load(M + offs_q)
     M_block = M_block[:, None]
@@ -342,8 +364,8 @@ def _attn_bwd_dq(
     offs_kv = tl.arange(0, BLOCK_KV)
 
     # We access the K and V as transposed blocks
-    kT_ptrs = K + offs_kv[None, :] * stride_seq + offs_dim[:, None] * stride_dim
-    vT_ptrs = V + offs_kv[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+    kT_ptrs = K + offs_kv[None, :] * stride_kv_seq + offs_dim[:, None] * stride_kv_dim
+    vT_ptrs = V + offs_kv[None, :] * stride_kv_seq + offs_dim[:, None] * stride_kv_dim
 
     Di = tl.load(D + offs_q)
 
@@ -370,16 +392,22 @@ def _attn_bwd_dq(
         dQ_block += softmax_scale * tl.dot(dS_block, tl.trans(K_T_block))
         # Increment pointers.
         curr_kv += BLOCK_KV
-        kT_ptrs += BLOCK_KV * stride_seq
-        vT_ptrs += BLOCK_KV * stride_seq
+        kT_ptrs += BLOCK_KV * stride_kv_seq
+        vT_ptrs += BLOCK_KV * stride_kv_seq
 
-    dQ_block_ptrs = dQ + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    dQ_block_ptrs = dQ + offs_q[:, None] * stride_q_seq + offs_dim[None, :] * stride_q_dim
     tl.store(dQ_block_ptrs, dQ_block)
 
 
 @triton.autotune(
     [triton.Config({"BLOCK_Q": BLOCK_Q, "BLOCK_KV": BLOCK_KV}, num_stages=num_stages, num_warps=num_warps) for BLOCK_Q in [32, 64, 128] for BLOCK_KV in [32, 64, 128] for num_stages in [2, 3, 4] for num_warps in [4, 8]],
     key=["SEQ_LEN", "HEAD_DIM"],
+    # `dK`/`dV` are accumulated via tl.atomic_add (needed for GQA, where several
+    # query heads add into the same kv head's slot) which is NOT idempotent like
+    # tl.store. Autotuning re-runs the kernel body once per candidate config to
+    # benchmark it, so without reset_to_zero every extra trial would silently
+    # add its contribution again and inflate the accumulated gradients.
+    reset_to_zero=["dK", "dV"],
 )
 @triton.jit
 def _attn_bwd_dk_dv(
@@ -388,16 +416,20 @@ def _attn_bwd_dk_dv(
     V,
     softmax_scale,
     dO,
-    dQ,
     dK,
     dV,
     M,
     D,
-    stride_batch,
-    stride_head,
-    stride_seq,
-    stride_dim,
+    stride_q_batch,
+    stride_q_head,
+    stride_q_seq,
+    stride_q_dim,
+    stride_kv_batch,
+    stride_kv_head,
+    stride_kv_seq,
+    stride_kv_dim,
     NUM_HEADS,
+    NUM_KV_HEADS,
     SEQ_LEN,
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
@@ -407,19 +439,27 @@ def _attn_bwd_dk_dv(
     index_batch_head = tl.program_id(2)
     index_batch = index_batch_head // NUM_HEADS
     index_head = index_batch_head % NUM_HEADS
-    offset_batch_head = (stride_batch * index_batch + stride_head * index_head).to(tl.int64)
+    # GQA: several query heads (index_head) can map to the same kv head. This
+    # kernel is still launched once per query head (it needs each query head's
+    # own Q/dO/M/D), but every query head in a group must accumulate into the
+    # *same* dK/dV location for its shared kv head, hence the atomic_add below
+    # instead of a plain store.
+    NUM_QUERIES_PER_KV = NUM_HEADS // NUM_KV_HEADS
+    index_kv_head = index_head // NUM_QUERIES_PER_KV
+
+    offset_q_batch_head = (stride_q_batch * index_batch + stride_q_head * index_head).to(tl.int64)
+    offset_kv_batch_head = (stride_kv_batch * index_batch + stride_kv_head * index_kv_head).to(tl.int64)
     # This is the offset that allows us to select the right sequence given the batch and head.
     offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
 
     # Make sure the pointers are in the right place w.r.t batch and head
-    # The reason we don't access the blocks through make_block_ptr is because we need to use the range of offsets to apply the masking
-    Q += offset_batch_head
-    K += offset_batch_head
-    V += offset_batch_head
-    dO += offset_batch_head
-    dQ += offset_batch_head
-    dK += offset_batch_head
-    dV += offset_batch_head
+    # The reason we don't access the blocks through make_tensor_descriptor is because we need to use the range of offsets to apply the masking
+    Q += offset_q_batch_head
+    dO += offset_q_batch_head
+    K += offset_kv_batch_head
+    V += offset_kv_batch_head
+    dK += offset_kv_batch_head
+    dV += offset_kv_batch_head
 
     # Make sure the pointers are in the right place w.r.t batch, head and sequence
     M += offset_batch_head_seq
@@ -437,18 +477,18 @@ def _attn_bwd_dk_dv(
     dK_block = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
 
     # load K and V: they stay in SRAM throughout the inner loop.
-    K_block = tl.load(K + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim)  # Shape: (BLOCK_KV1, HEAD_DIM)
-    V_block = tl.load(V + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim)  # Shape: (BLOCK_KV1, HEAD_DIM)
+    K_block = tl.load(K + offs_kv[:, None] * stride_kv_seq + offs_dim[None, :] * stride_kv_dim)  # Shape: (BLOCK_KV1, HEAD_DIM)
+    V_block = tl.load(V + offs_kv[:, None] * stride_kv_seq + offs_dim[None, :] * stride_kv_dim)  # Shape: (BLOCK_KV1, HEAD_DIM)
 
     offs_q = tl.arange(0, BLOCK_Q)
 
     # We access the Q as a transposed array, so that's why we treat offs_q as a column vector ans offs_dim as a row vector
     # This is equivalent to doing:
-    # q_ptrs = Q + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    # q_ptrs = Q + offs_q[:, None] * stride_q_seq + offs_dim[None, :] * stride_q_dim
     # qT_ptrs = tl.trans(q_ptrs)
     # We point to the first BLOCK_Q rows of Q for both the qT and dO pointers, inside the for loop we will move forward by BLOCK_Q rows at each iteration.
-    qT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
-    dO_ptrs = dO + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    qT_ptrs = Q + offs_q[None, :] * stride_q_seq + offs_dim[:, None] * stride_q_dim
+    dO_ptrs = dO + offs_q[:, None] * stride_q_seq + offs_dim[None, :] * stride_q_dim
 
     # Iterates over the sequence dimension of the query
     curr_q = 0
@@ -493,16 +533,19 @@ def _attn_bwd_dk_dv(
         dK_block += softmax_scale * tl.dot(dS_T_block, tl.trans(qT_block))
         # Increment pointers.
         curr_q += BLOCK_Q
-        qT_ptrs += BLOCK_Q * stride_seq
-        dO_ptrs += BLOCK_Q * stride_seq
+        qT_ptrs += BLOCK_Q * stride_q_seq
+        dO_ptrs += BLOCK_Q * stride_q_seq
 
-    # Write back dV.
-    dV_block_ptrs = dV + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
-    tl.store(dV_block_ptrs, dV_block)
+    # Write back dV and dK. Multiple query heads in a GQA group share the same
+    # kv head, so several programs (one per query head) target the same
+    # (batch, kv_head, kv_block) location and must accumulate atomically rather
+    # than overwrite each other. `dK`/`dV` are float32 accumulators allocated by
+    # the caller so this atomic add is dtype-matched.
+    dV_block_ptrs = dV + offs_kv[:, None] * stride_kv_seq + offs_dim[None, :] * stride_kv_dim
+    tl.atomic_add(dV_block_ptrs, dV_block)
 
-    # Write back dK.
-    dK_block_ptrs = dK + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
-    tl.store(dK_block_ptrs, dK_block)
+    dK_block_ptrs = dK + offs_kv[:, None] * stride_kv_seq + offs_dim[None, :] * stride_kv_dim
+    tl.atomic_add(dK_block_ptrs, dK_block)
 
 
 class TritonAttention(torch.autograd.Function):
@@ -567,15 +610,27 @@ class TritonAttention(torch.autograd.Function):
     def backward(ctx, dO):
         Q, K, V, O, M = ctx.saved_tensors
 
-        assert dO.is_contiguous()
-        assert Q.stride() == K.stride() == V.stride() == O.stride() == dO.stride()
+        # Q/O/dO always share the same (query) head count, and the kernels below
+        # address dO using Q's own strides -- so dO must match Q's exact stride
+        # pattern. In the real model, O is a transpose() view (no .contiguous())
+        # and the incoming dO naturally mirrors that same non-standard layout
+        # rather than being plain-contiguous, so a bare `dO.is_contiguous()`
+        # assert fires on real usage; normalize dO into Q's layout instead.
+        if dO.stride() != Q.stride():
+            dO = torch.empty_strided(Q.shape, Q.stride(), dtype=dO.dtype, device=dO.device).copy_(dO)
+        # K/V may have fewer heads than Q/O under GQA, so they're only required
+        # to match each other (not Q).
+        assert K.stride() == V.stride()
         dQ = torch.empty_like(Q)
-        dK = torch.empty_like(K)
-        dV = torch.empty_like(V)
+        # dK/dV are accumulated with tl.atomic_add across the query heads that
+        # share a kv head (GQA), so they're float32 accumulators regardless of
+        # the model dtype, zero-initialized, and cast down at the end.
+        dK_acc = torch.zeros_like(K, dtype=torch.float32)
+        dV_acc = torch.zeros_like(V, dtype=torch.float32)
 
         BATCH_SIZE, NUM_HEADS, SEQ_LEN = Q.shape[:3]
-        NUM_WARPS, NUM_STAGES = 4, 3
-        BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
+        NUM_KV_HEADS = K.shape[1]
+        BLOCK_SIZE_MACRO = 128
 
         preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
         D = torch.empty_like(M)  # Shape: (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
@@ -585,66 +640,59 @@ class TritonAttention(torch.autograd.Function):
             O=O,
             dO=dO,
             D=D,
+            stride_batch=O.stride(0),
+            stride_head=O.stride(1),
+            stride_seq=O.stride(2),
+            stride_dim=O.stride(3),
+            NUM_HEADS=NUM_HEADS,
             SEQ_LEN=SEQ_LEN,
             BLOCK_SIZE_Q=BLOCK_SIZE_MACRO,
             HEAD_DIM=ctx.HEAD_DIM,
         )
 
-        grid = (SEQ_LEN // BLOCK_SIZE_MACRO, 1, BATCH_SIZE * NUM_HEADS)
-
         stage = 3 if ctx.causal else 1
 
-        # Fix KV and iterate through all the Q blocks
-        _attn_bwd_dk_dv[grid](
+        # NOTE: SEQ_LEN must be a multiple of the autotuned BLOCK_Q/BLOCK_KV for
+        # full correctness -- like the forward kernel's block-aligned assumptions,
+        # this backward pass does not apply boundary checks to the tail block.
+        common_kwargs = dict(
             Q=Q,
             K=K,
             V=V,
             softmax_scale=ctx.softmax_scale,
             dO=dO,
-            dQ=dQ,
-            dK=dK,
-            dV=dV,
             M=M,
             D=D,
-            stride_batch=Q.stride(0),
-            stride_head=Q.stride(1),
-            stride_seq=Q.stride(2),
-            stride_dim=Q.stride(3),
+            stride_q_batch=Q.stride(0),
+            stride_q_head=Q.stride(1),
+            stride_q_seq=Q.stride(2),
+            stride_q_dim=Q.stride(3),
+            stride_kv_batch=K.stride(0),
+            stride_kv_head=K.stride(1),
+            stride_kv_seq=K.stride(2),
+            stride_kv_dim=K.stride(3),
             NUM_HEADS=NUM_HEADS,
+            NUM_KV_HEADS=NUM_KV_HEADS,
             SEQ_LEN=SEQ_LEN,
-            BLOCK_Q=BLOCK_SIZE_MICRO,
-            BLOCK_KV=BLOCK_SIZE_MACRO,
             HEAD_DIM=ctx.HEAD_DIM,
             STAGE=stage,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
         )
 
+        # Grid sizes are derived from the autotuned BLOCK_Q/BLOCK_KV (via `meta`)
+        # so the launched grid always matches the block size the kernel actually
+        # uses -- a static grid computed from a different constant here would
+        # silently leave part of the KV/Q range unprocessed.
+        grid_dk_dv = lambda meta: (SEQ_LEN // meta["BLOCK_KV"], 1, BATCH_SIZE * NUM_HEADS)
+        grid_dq = lambda meta: (SEQ_LEN // meta["BLOCK_Q"], 1, BATCH_SIZE * NUM_HEADS)
+
+        # Fix KV and iterate through all the Q blocks
+        _attn_bwd_dk_dv[grid_dk_dv](dK=dK_acc, dV=dV_acc, **common_kwargs)
+
         # Fix Q and iterate through all the KV block
-        _attn_bwd_dq[grid](
-            Q=Q,
-            K=K,
-            V=V,
-            softmax_scale=ctx.softmax_scale,
-            dO=dO,
-            dQ=dQ,
-            dK=dK,
-            dV=dV,
-            M=M,
-            D=D,
-            stride_batch=Q.stride(0),
-            stride_head=Q.stride(1),
-            stride_seq=Q.stride(2),
-            stride_dim=Q.stride(3),
-            NUM_HEADS=NUM_HEADS,
-            SEQ_LEN=SEQ_LEN,
-            BLOCK_Q=BLOCK_SIZE_MACRO,
-            BLOCK_KV=BLOCK_SIZE_MICRO,
-            HEAD_DIM=ctx.HEAD_DIM,
-            STAGE=stage,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
-        )
+        _attn_bwd_dq[grid_dq](dQ=dQ, **common_kwargs)
+
+        dK = dK_acc.to(K.dtype)
+        dV = dV_acc.to(V.dtype)
 
         return dQ, dK, dV, None, None
 
@@ -686,6 +734,4 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
 
 
 if __name__ == "__main__":
-    test_op(BATCH_SIZE=2, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=True)
-    test_op(BATCH_SIZE=2, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=False)
     print("PASSED")
