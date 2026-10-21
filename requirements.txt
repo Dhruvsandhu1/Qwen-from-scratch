@@ -1,0 +1,6 @@
+# Install a CUDA build of PyTorch first (it includes Triton on Linux / WSL):
+#   https://pytorch.org/get-started/locally/
+torch
+transformers
+accelerate
+loguru
