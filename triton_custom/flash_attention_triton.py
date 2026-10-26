@@ -48,6 +48,10 @@ def _attn_fwd_inner(
             m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
             QK_block -= m_ij[:, None]
         else:
+            if STAGE == 3:
+                # Non-causal: the last block can run past the end of the sequence. Those keys are
+                # zero padding, so give them no weight (a score of 0 would still count in the softmax).
+                QK_block = QK_block + tl.where((start_kv + offs_kv)[None, :] < SEQ_LEN, 0.0, -1.0e6)
             # Compute the maximum value of qk or keep the old max value
             m_ij = tl.maximum(m_i, tl.max(QK_block, 1) * softmax_scale)
             QK_block = QK_block * softmax_scale - m_ij[:, None]
@@ -561,6 +565,10 @@ class TritonAttention(torch.autograd.Function):
         HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V = Q.shape[-1], K.shape[-1], V.shape[-1]
         BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
+        # The backward kernels have no boundary checks: rows past the last full block would be left
+        # uncomputed and the gradients silently wrong. Fail now rather than in backward.
+        if any(ctx.needs_input_grad[:3]) and SEQ_LEN % 128 != 0:
+            raise ValueError(f"TritonAttention's backward pass needs SEQ_LEN to be a multiple of 128 (got {SEQ_LEN}). Use torch.nn.functional.scaled_dot_product_attention for training at other lengths.")
 
         O = torch.empty_like(Q)
         stage = 3 if causal else 1
@@ -659,9 +667,8 @@ class TritonAttention(torch.autograd.Function):
 
         stage = 3 if ctx.causal else 1
 
-        # NOTE: SEQ_LEN must be a multiple of the autotuned BLOCK_Q/BLOCK_KV for
-        # full correctness -- like the forward kernel's block-aligned assumptions,
-        # this backward pass does not apply boundary checks to the tail block.
+        # SEQ_LEN is a multiple of 128 (checked in forward), so it is also a multiple of every
+        # autotuned BLOCK_Q/BLOCK_KV (32, 64 or 128): the grids below cover every row exactly.
         common_kwargs = dict(
             Q=Q,
             K=K,
@@ -741,4 +748,6 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
 
 
 if __name__ == "__main__":
+    test_op(BATCH_SIZE=2, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=True)
+    test_op(BATCH_SIZE=2, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=False)
     print("PASSED")

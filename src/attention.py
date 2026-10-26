@@ -63,30 +63,39 @@ def flash_attention_forward(
     # (True = attend), or None when plain causal attention with no padding is enough.
     q_len, kv_len = query.shape[2], key.shape[2]
 
-    if q_len == 1 and attention_mask is None:
+    # The Triton kernels run on CUDA only, and are used for inference only: flash decoding has no
+    # backward pass, and the prefill kernel's backward needs lengths that are a multiple of 128.
+    # On CPU, or when autograd needs to track the result (training), use PyTorch SDPA instead.
+    use_triton = query.is_cuda and not (torch.is_grad_enabled() and any(t.requires_grad for t in (query, key, value)))
+
+    if use_triton and q_len == 1 and attention_mask is None:
         # Decode step: Triton flash decoding, dequantizing INT8 keys/values in registers if given.
         # `kv_len` (a device tensor) is set by the CUDA-graph decode step, where key/value are the
         # whole fixed-size cache buffers; otherwise every given key/value token is valid.
         attn_output = flash_decode(query, key, value, sm_scale=scaling, key_scales=key_scales, value_scales=value_scales, kv_len=kwargs.get("kv_len"))
     elif is_int8:
-        raise ValueError("INT8 keys/values are only supported for single-token decoding without a padding mask.")
-    elif attention_mask is None and q_len == kv_len:
+        raise ValueError("INT8 keys/values need the Triton decode path: CUDA, no gradients, one new token and no padding mask.")
+    elif use_triton and attention_mask is None and q_len == kv_len:
         # Prefill with no earlier tokens and no padding: Triton FlashAttention-2.
         attn_output = TritonAttention.apply(query, key, value, is_causal, scaling)
     else:
-        # Padding, or several new tokens on top of a cache: PyTorch SDPA with an explicit mask.
+        # Padding, several new tokens on top of a cache, CPU, or training: PyTorch SDPA.
         if query.shape[1] != key.shape[1]:  # GQA: SDPA needs one KV head per query head
             num_queries_per_kv = query.shape[1] // key.shape[1]
-            # expand is a zero-copy view, much cheaper than repeat_interleave
             batch, h_kv, seq, dim = key.shape
             key = key[:, :, None, :, :].expand(batch, h_kv, num_queries_per_kv, seq, dim).reshape(batch, -1, seq, dim)
             value = value[:, :, None, :, :].expand(batch, h_kv, num_queries_per_kv, seq, dim).reshape(batch, -1, seq, dim)
 
+        sdpa_is_causal = False
         if attention_mask is None and is_causal:
-            # The new queries are the last q_len positions, so the causal mask is aligned bottom-right.
-            # (SDPA's `is_causal=True` aligns it top-left, which is wrong when q_len < kv_len.)
-            attention_mask = torch.ones(q_len, kv_len, dtype=torch.bool, device=query.device).tril(diagonal=kv_len - q_len)
+            if q_len == kv_len:
+                # SDPA's `is_causal=True` aligns the mask top-left, which is right when the lengths match,
+                # and lets SDPA use its fastest kernels.
+                sdpa_is_causal = True
+            else:
+                # The new queries are the last q_len positions, so the causal mask is aligned bottom-right.
+                attention_mask = torch.ones(q_len, kv_len, dtype=torch.bool, device=query.device).tril(diagonal=kv_len - q_len)
 
-        attn_output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=dropout if module.training else 0.0, scale=scaling)
+        attn_output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=dropout if module.training else 0.0, is_causal=sdpa_is_causal, scale=scaling)
 
     return attn_output.transpose(1, 2).contiguous(), None

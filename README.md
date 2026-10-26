@@ -16,7 +16,7 @@ Stock Hugging Face (`AutoModelForCausalLM`, default settings) vs this implementa
 | ~4k tokens | 29.3 → 34.9 tok/s | 1.19× | 1034.5 → 948.0 ms | 1.09× |
 
 - **Multi-turn chat** (sampling, growing history): 30.3 → 33.8 tok/s (**1.12×**).
-- **Memory beyond the weights** at a ~4k-token prompt: 501 → 365 MB (**27% less**), thanks to the INT8 KV cache.
+- **KV cache size:** the INT8 cache needs about half the memory of a bf16 cache (int8 values plus one fp32 scale per token and head).
 
 Measured on an RTX 4060 Laptop GPU (8 GB) under WSL2, with PyTorch 2.14, Triton 3.8 and transformers 5.20. Run `examples/compare_with_hf.py` to reproduce this on your own GPU.
 
@@ -28,7 +28,7 @@ Outputs are not bit-identical to Hugging Face: the INT8 cache and different kern
 
 | Component | What it does |
 |---|---|
-| **Flash Attention (prefill)** `triton_custom/flash_attention_triton.py` | Tiled causal attention with online softmax, native grouped-query attention, forward and backward. One compiled kernel serves every prompt length, and autotuning results are cached on disk. |
+| **Flash Attention (prefill)** `triton_custom/flash_attention_triton.py` | Tiled causal attention with online softmax and native grouped-query attention. One compiled kernel serves every prompt length, and autotuning results are cached on disk. It also has a backward pass for standalone use, which needs sequence lengths that are a multiple of 128 (the model trains with PyTorch SDPA instead). |
 | **Flash Decoding (generation)** `triton_custom/flash_decoding_triton.py` | Splits the KV cache across GPU blocks, then merges the partial softmax results. Reads the INT8 cache directly and dequantizes in registers. |
 | **INT8 KV cache** `QuantizedStaticCache` | Stores keys and values as int8 with one scale per token and head, which halves cache memory. Used automatically by `generate()`. |
 | **CUDA-graph decoding** | Each decode step is captured once and replayed with a single launch, instead of ~1,200 small kernel launches from Python. |
@@ -53,7 +53,7 @@ All of this is used automatically when the model is loaded with `attn_implementa
 ├── examples/
 │   ├── interactive.py           # Chat in the terminal
 │   └── compare_with_hf.py       # Benchmark against stock Hugging Face
-├── tests/                       # Smoke tests for config and tokenizer loading
+├── tests/                       # Kernels and a tiny random model vs Hugging Face, plus config/tokenizer smoke tests
 └── model/                       # Model weights and tokenizer (download separately)
 ```
 
@@ -105,6 +105,8 @@ The script loads each model in its own process and reports time to first token, 
 pip install pytest
 pytest tests
 ```
+
+`tests/test_kernels.py` checks the Triton kernels against PyTorch. `tests/test_model.py` builds a tiny random Qwen2 and checks it against the Hugging Face implementation with the same weights: generation with and without the INT8 cache and CUDA graph, cache reuse across `generate()` calls, padded batches, the CPU fallback, and training gradients. They take a few minutes the first time (kernel compilation and autotuning) and skip on machines without a CUDA GPU, except the CPU test. The smoke tests need the weights in `./model`.
 
 ## Limitations
 

@@ -51,7 +51,7 @@ def main():
         default=1024,
         help="Maximum number of new tokens to generate",
     )
-    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature for generation")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature for generation (0 = greedy decoding)")
     parser.add_argument(
         "--device_map",
         type=str,
@@ -65,7 +65,7 @@ def main():
 
     model_path = args.model_path
     config = AutoConfig.from_pretrained(model_path)
-    logger.info("Loaded config: model_type=%s, layers=%s", config.model_type, config.num_hidden_layers)
+    logger.info("Loaded config: model_type={}, layers={}", config.model_type, config.num_hidden_layers)
 
     if not isinstance(getattr(torch, args.dtype, None), torch.dtype):
         raise ValueError(f"Invalid dtype: '{args.dtype}'")
@@ -74,7 +74,7 @@ def main():
     logger.info("Loading model (this may take a while)...")
     # Custom Triton kernels (registered in src/modeling_qwen2.py) need CUDA; use SDPA on CPU.
     attn_implementation = "sdpa" if args.device_map == "cpu" or not torch.cuda.is_available() else "triton_attention"
-    model = Qwen2ForCausalLM.from_pretrained(model_path, config=config, torch_dtype=torch_dtype, device_map=args.device_map, attn_implementation=attn_implementation)
+    model = Qwen2ForCausalLM.from_pretrained(model_path, config=config, dtype=torch_dtype, device_map=args.device_map, attn_implementation=attn_implementation)
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
@@ -95,13 +95,10 @@ def main():
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
+            # Temperature 0 means greedy decoding; HF rejects sampling with temperature 0.
+            sampling = {"do_sample": True, "temperature": args.temperature} if args.temperature > 0 else {"do_sample": False}
             with torch.no_grad():
-                generated = model.generate(
-                    **model_inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    do_sample=True if args.temperature != 1.0 else False,
-                )
+                generated = model.generate(**model_inputs, max_new_tokens=args.max_new_tokens, **sampling)
 
             generated_ids = [out[len(inp) :] for inp, out in zip(model_inputs.input_ids, generated)]
             response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]

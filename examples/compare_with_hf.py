@@ -62,7 +62,8 @@ def run_worker(args):
 
         model = Qwen2ForCausalLM.from_pretrained(args.model_path, dtype="auto", device_map=device, attn_implementation="triton_attention")
     load_s = time.perf_counter() - t0
-    weights_gb = torch.cuda.memory_allocated() / 1e9
+    weights_bytes = torch.cuda.memory_allocated()
+    weights_gb = weights_bytes / 1e9
 
     def timed(fn):
         torch.cuda.synchronize()
@@ -96,8 +97,9 @@ def run_worker(args):
                 "prefill_ms": statistics.median(prefill) * 1000,
                 "decode_tok_s": statistics.median(decode),
                 "total_s": statistics.median(total),
-                # Memory used beyond the weights: KV cache, activations, logits.
-                "peak_extra_mem_mb": (torch.cuda.max_memory_allocated() - torch.cuda.memory_allocated()) / 1e6,
+                # Peak memory used beyond the weights: KV cache, activations, logits. Measured against the
+                # weights alone, so a cache the model keeps between calls (the custom INT8 cache) is counted.
+                "peak_extra_mem_mb": (torch.cuda.max_memory_allocated() - weights_bytes) / 1e6,
                 "tokens": out[0, prompt_len:].tolist(),
             }
             c = result["cases"][name]
